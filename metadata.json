@@ -1,0 +1,6 @@
+{
+  "name": "Luan Hércules Tattoo Studio",
+  "description": "Portfólio editorial, história traço por traço, trilha sonora ambiente, agendamento personalizado e painel administrativo para o estúdio Luan Hércules Tattoo Studio.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
