@@ -692,8 +692,8 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
             ) : (
               <div className="space-y-1">
                 <p className="text-sm text-[#A5A5A5]">
-                  Conecte sua conta Google administrativa para gerenciar a pasta LUAN HERCULES TATTOO
-                  no Drive e a planilha LUAN HERCULES TATTOO — GERENCIAMENTO.
+                  Conecte sua conta Google administrativa para gerenciar a pasta LUAN HÉRCULES TATTOO
+                  no Drive e a planilha LUAN HÉRCULES TATTOO — GERENCIAMENTO.
                 </p>
                 {googleStatus && !googleStatus.configured && (
                   <p className="text-xs text-[#E2C47A]">

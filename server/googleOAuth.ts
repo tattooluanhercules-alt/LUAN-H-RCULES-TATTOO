@@ -102,9 +102,14 @@ export function resolveRedirectUri(req?: Request): string {
   return 'http://localhost:3000/api/google/callback';
 }
 
+function getGoogleClientId(): string {
+  return (process.env.GOOGLE_CLIENT_ID || process.env.ID_DO_CLIENTE_DO_GOOGLE || '').trim();
+}
+
 export function getOAuthConfigDiagnostics(req?: Request) {
+  const clientId = getGoogleClientId();
   const missingEnvVars: string[] = [];
-  if (!process.env.GOOGLE_CLIENT_ID) missingEnvVars.push('GOOGLE_CLIENT_ID');
+  if (!clientId) missingEnvVars.push('GOOGLE_CLIENT_ID');
   if (!process.env.GOOGLE_CLIENT_SECRET) missingEnvVars.push('GOOGLE_CLIENT_SECRET');
   if (!process.env.ADMIN_EMAIL) missingEnvVars.push('ADMIN_EMAIL');
 
@@ -123,7 +128,7 @@ export function createOAuthAuthorizationUrl(
   res: Response,
   adminUsername: string
 ): string {
-  const clientId = process.env.GOOGLE_CLIENT_ID?.trim();
+  const clientId = getGoogleClientId();
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim();
   const adminEmail = process.env.ADMIN_EMAIL?.trim();
 
@@ -246,7 +251,7 @@ export async function exchangeAuthorizationCode(
   refreshToken: string;
   expiresIn: number;
 }> {
-  const clientId = process.env.GOOGLE_CLIENT_ID?.trim() || '';
+  const clientId = getGoogleClientId();
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim() || '';
 
   const tokenRes = await fetch(GOOGLE_TOKEN_ENDPOINT, {
@@ -379,7 +384,7 @@ export async function refreshAccessTokenWithRefreshToken(
   refreshToken: string,
   emailHint = ''
 ): Promise<ServerGoogleTokens> {
-  const clientId = process.env.GOOGLE_CLIENT_ID?.trim();
+  const clientId = getGoogleClientId();
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim();
 
   if (!clientId || !clientSecret) {
@@ -467,7 +472,7 @@ export async function getValidServerGoogleAccessToken(req?: Request): Promise<st
 
   if (!googleExplicitlyDisconnected) {
     const envRefresh = process.env.GOOGLE_REFRESH_TOKEN?.trim();
-    if (envRefresh && process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    if (envRefresh && getGoogleClientId() && process.env.GOOGLE_CLIENT_SECRET) {
       try {
         const refreshed = await refreshAccessTokenWithRefreshToken(
           envRefresh,
