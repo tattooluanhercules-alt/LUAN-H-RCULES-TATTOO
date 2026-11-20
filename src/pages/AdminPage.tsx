@@ -19,17 +19,11 @@ import {
   Settings,
   Sparkles,
   Trash2,
+  Unplug,
   Upload,
 } from 'lucide-react';
-import type { User } from 'firebase/auth';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { ResilientImage } from '../components/ResilientImage';
-import {
-  getWorkspaceAccessToken,
-  initGoogleWorkspaceAuth,
-  signInWithGoogleWorkspace,
-  signOutGoogleWorkspace,
-} from '../services/googleWorkspaceAuth';
 import {
   adminLogin,
   adminLogout,
@@ -37,8 +31,11 @@ import {
   deleteAppointment,
   deleteGalleryItem,
   deleteMusicTrack,
+  disconnectGoogleAccount,
   fetchAdminDashboard,
   fetchAdminSession,
+  fetchGoogleAuthUrl,
+  fetchGoogleStatus,
   initializeGoogleWorkspace,
   reorderStoryChapters,
   updateAppointmentStatus,
@@ -48,6 +45,7 @@ import {
   updateStudioConfig,
   uploadStudioAsset,
   type AdminDashboardPayload,
+  type GoogleConnectionStatus,
 } from '../services/studioApi';
 import type {
   AdminSessionStatus,
@@ -83,9 +81,8 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
   const [pwdSuccess, setPwdSuccess] = useState<string | null>(null);
   const [pwdSubmitting, setPwdSubmitting] = useState(false);
 
-  // Google Workspace Auth state
-  const [googleUser, setGoogleUser] = useState<User | null>(null);
-  const [googleConnected, setGoogleConnected] = useState(false);
+  // Google OAuth Server-Side Status
+  const [googleStatus, setGoogleStatus] = useState<GoogleConnectionStatus | null>(null);
   const [googleLoading, setGoogleLoading] = useState(false);
 
   // Dashboard data
@@ -114,11 +111,24 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
     setTimeout(() => setToast(null), 5000);
   }, []);
 
+  const refreshGoogleStatus = useCallback(async () => {
+    try {
+      const gs = await fetchGoogleStatus();
+      setGoogleStatus(gs);
+    } catch {
+      // Ignore if session not ready
+    }
+  }, []);
+
   const loadDashboard = useCallback(async () => {
     setLoadingDash(true);
     try {
-      const data = await fetchAdminDashboard();
+      const [data, gs] = await Promise.all([
+        fetchAdminDashboard(),
+        fetchGoogleStatus().catch(() => null),
+      ]);
       setDashboard(data);
+      if (gs) setGoogleStatus(gs);
     } catch (err) {
       showToast('err', err instanceof Error ? err.message : 'Erro ao carregar painel.');
     } finally {
@@ -127,6 +137,17 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
   }, [showToast]);
 
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const googleParam = params.get('google');
+    const googleErr = params.get('google_error');
+    if (googleParam === 'connected') {
+      showToast('ok', 'Conta Google conectada e sincronizada com sucesso.');
+      window.history.replaceState({}, '', '/admin');
+    } else if (googleErr) {
+      showToast('err', `Erro na conexão Google: ${googleErr}`);
+      window.history.replaceState({}, '', '/admin');
+    }
+
     fetchAdminSession()
       .then((s) => {
         setSession(s);
@@ -145,18 +166,30 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
       })
       .finally(() => setLoadingSession(false));
 
-    const unsub = initGoogleWorkspaceAuth(
-      (u) => {
-        setGoogleUser(u);
-        setGoogleConnected(Boolean(getWorkspaceAccessToken()));
-      },
-      () => {
-        setGoogleUser(null);
-        setGoogleConnected(false);
+    const onMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
+      if (event.data?.type === 'lh-google-oauth-result') {
+        if (event.data.ok) {
+          showToast('ok', event.data.message || 'Conta Google conectada com sucesso.');
+          loadDashboard();
+          onStudioMutated();
+        } else {
+          showToast('err', event.data.message || 'Não foi possível conectar a conta Google.');
+        }
       }
-    );
-    return () => unsub();
-  }, [loadDashboard]);
+    };
+
+    const onFocus = () => {
+      refreshGoogleStatus();
+    };
+
+    window.addEventListener('message', onMessage);
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.removeEventListener('message', onMessage);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [loadDashboard, onStudioMutated, refreshGoogleStatus, showToast]);
 
   const handleLogin = async (e: FormEvent) => {
     e.preventDefault();
@@ -214,36 +247,41 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
     }
   };
 
-  const handleGoogleConnectAndSync = async () => {
+  const handleConnectGoogle = async () => {
     setGoogleLoading(true);
     try {
-      const { user } = await signInWithGoogleWorkspace();
-      setGoogleUser(user);
-      setGoogleConnected(true);
-      const syncRes = await initializeGoogleWorkspace();
-      setSession((prev) =>
-        prev
-          ? {
-              ...prev,
-              passwordStoredInAppData: syncRes.passwordStoredInAppData,
-              mustChangePassword: syncRes.mustChangePassword,
-            }
-          : prev
-      );
-      await loadDashboard();
-      onStudioMutated();
-      showToast(
-        'ok',
-        'Google Drive e Google Sheets sincronizados com a pasta LUAN HERCULES TATTOO.'
-      );
+      const { authUrl } = await fetchGoogleAuthUrl();
+      // Open Google OAuth consent screen in a new tab cleanly (avoids iframe X-Frame-Options block and window.open)
+      const link = document.createElement('a');
+      link.href = authUrl;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
     } catch (err) {
       showToast(
         'err',
-        err instanceof Error ? err.message : 'Não foi possível conectar com o Google.'
+        err instanceof Error ? err.message : 'Não foi possível iniciar a autenticação Google.'
       );
     } finally {
       setGoogleLoading(false);
     }
+  };
+
+  const handleDisconnectGoogle = () => {
+    runConfirmed({
+      title: 'Desconectar conta Google',
+      description:
+        'A sessão Google OAuth será revogada no servidor e o status passará para Desconectado. Seus arquivos no Google Drive e planilhas no Google Sheets não serão apagados.',
+      confirmLabel: 'Desconectar',
+      destructive: true,
+      action: async () => {
+        await disconnectGoogleAccount();
+        await refreshGoogleStatus();
+        showToast('ok', 'Conta Google desconectada com sucesso.');
+      },
+    });
   };
 
   const handleSyncOnly = async () => {
@@ -262,7 +300,6 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
 
   const handleLogout = async () => {
     await adminLogout();
-    await signOutGoogleWorkspace().catch(() => undefined);
     setSession({
       authenticated: false,
       username: null,
@@ -271,6 +308,7 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
       passwordStoredInAppData: false,
     });
     setDashboard(null);
+    setGoogleStatus(null);
   };
 
   const runConfirmed = (opts: {
@@ -304,6 +342,7 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
     const files = Array.from(e.target.files || []);
     e.target.value = '';
     if (files.length === 0) return;
+    const googleConnected = Boolean(googleStatus?.connected || dashboard?.workspace.connected);
     if (!googleConnected && dashboard?.workspace.mode !== 'server-env') {
       showToast('err', 'Conecte sua conta Google primeiro para enviar fotos ao Google Drive.');
       return;
@@ -331,6 +370,7 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
 
   // Story photo upload (single chapter replacement or batch 12)
   const handleStoryPhotoUpload = async (storyId: string, file: File) => {
+    const googleConnected = Boolean(googleStatus?.connected || dashboard?.workspace.connected);
     if (!googleConnected && dashboard?.workspace.mode !== 'server-env') {
       showToast('err', 'Conecte sua conta Google primeiro para enviar fotografias da história.');
       return;
@@ -357,6 +397,7 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
+    const googleConnected = Boolean(googleStatus?.connected || dashboard?.workspace.connected);
     if (!googleConnected && dashboard?.workspace.mode !== 'server-env') {
       showToast('err', 'Conecte sua conta Google para salvar a música na pasta TRILHA-SONORA.');
       return;
@@ -610,25 +651,35 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
         {/* Google Drive & Sheets Connection Strip */}
         <section className="p-5 bg-[#151515] border border-white/10 rounded-sm flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div>
-            <p className="text-xs tracking-[0.18em] uppercase text-[#C9A34A] mb-1">
-              Google Drive & Google Planilhas
-            </p>
-            {googleConnected || dashboard?.workspace.connected ? (
+            <div className="flex flex-wrap items-center gap-3 mb-1">
+              <p className="text-xs tracking-[0.18em] uppercase text-[#C9A34A]">
+                Google Drive & Google Planilhas
+              </p>
+              <span
+                className={`text-xs font-medium ${
+                  googleStatus?.connected ? 'text-emerald-400' : 'text-[#A5A5A5]'
+                }`}
+              >
+                Status: {googleStatus?.connected ? 'Conectado' : 'Desconectado'}
+              </span>
+            </div>
+
+            {googleStatus?.connected ? (
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-white">
                 <span className="inline-flex items-center gap-1.5 text-emerald-400">
                   <CheckCircle2 className="w-4 h-4" /> Conectado
                 </span>
-                {googleUser?.email && (
+                {googleStatus.email && (
                   <>
                     <span className="text-white/25">·</span>
-                    <span className="text-[#A5A5A5]">{googleUser.email}</span>
+                    <span className="text-[#A5A5A5]">{googleStatus.email}</span>
                   </>
                 )}
-                {dashboard?.workspace.sheetUrl && (
+                {(googleStatus.sheetUrl || dashboard?.workspace.sheetUrl) && (
                   <>
                     <span className="text-white/25">·</span>
                     <a
-                      href={dashboard.workspace.sheetUrl}
+                      href={googleStatus.sheetUrl || dashboard?.workspace.sheetUrl || '#'}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="text-[#E2C47A] hover:underline inline-flex items-center gap-1"
@@ -639,64 +690,53 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
                 )}
               </div>
             ) : (
-              <p className="text-sm text-[#A5A5A5]">
-                Conecte sua conta Google para criar automaticamente as pastas no Drive, a planilha
-                LUAN HERCULES TATTOO — GERENCIAMENTO e proteger a senha no appDataFolder.
-              </p>
+              <div className="space-y-1">
+                <p className="text-sm text-[#A5A5A5]">
+                  Conecte sua conta Google administrativa para gerenciar a pasta LUAN HERCULES TATTOO
+                  no Drive e a planilha LUAN HERCULES TATTOO — GERENCIAMENTO.
+                </p>
+                {googleStatus && !googleStatus.configured && (
+                  <p className="text-xs text-[#E2C47A]">
+                    Variáveis pendentes no servidor: {googleStatus.missingEnvVars.join(', ')} ·
+                    Redirect URI: {googleStatus.redirectUri}
+                  </p>
+                )}
+              </div>
             )}
           </div>
 
           <div className="flex flex-wrap items-center gap-3 shrink-0">
-            {!googleConnected ? (
+            {!googleStatus?.connected ? (
               <button
                 type="button"
-                onClick={handleGoogleConnectAndSync}
+                onClick={handleConnectGoogle}
                 disabled={googleLoading}
-                className="gsi-material-button"
-              >
-                <div className="gsi-material-button-state" />
-                <div className="gsi-material-button-content-wrapper">
-                  <div className="gsi-material-button-icon">
-                    <svg
-                      version="1.1"
-                      xmlns="http://www.w3.org/2000/svg"
-                      viewBox="0 0 48 48"
-                      style={{ display: 'block' }}
-                    >
-                      <path
-                        fill="#EA4335"
-                        d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
-                      />
-                      <path
-                        fill="#4285F4"
-                        d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
-                      />
-                      <path
-                        fill="#FBBC05"
-                        d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
-                      />
-                      <path
-                        fill="#34A853"
-                        d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
-                      />
-                      <path fill="none" d="M0 0h48v48H0z" />
-                    </svg>
-                  </div>
-                  <span className="gsi-material-button-contents">
-                    {googleLoading ? 'Conectando...' : 'Sign in with Google'}
-                  </span>
-                </div>
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={handleSyncOnly}
-                disabled={googleLoading}
-                className="inline-flex items-center gap-2 px-4 py-2.5 bg-[#C9A34A] text-[#080808] hover:bg-[#E2C47A] text-xs font-semibold uppercase tracking-[0.12em] rounded-sm cursor-pointer disabled:opacity-50"
+                className="inline-flex items-center gap-2 px-5 py-2.5 bg-[#C9A34A] text-[#080808] hover:bg-[#E2C47A] text-xs font-semibold uppercase tracking-[0.12em] rounded-sm cursor-pointer disabled:opacity-50 transition-colors"
               >
                 <FolderSync className="w-4 h-4" />
-                <span>{googleLoading ? 'Sincronizando...' : 'Sincronizar Drive & Sheets'}</span>
+                <span>{googleLoading ? 'Conectando...' : 'Conectar Google'}</span>
               </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={handleSyncOnly}
+                  disabled={googleLoading}
+                  className="inline-flex items-center gap-2 px-4 py-2.5 bg-[#C9A34A] text-[#080808] hover:bg-[#E2C47A] text-xs font-semibold uppercase tracking-[0.12em] rounded-sm cursor-pointer disabled:opacity-50 transition-colors"
+                >
+                  <FolderSync className="w-4 h-4" />
+                  <span>{googleLoading ? 'Sincronizando...' : 'Sincronizar Drive & Sheets'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDisconnectGoogle}
+                  disabled={googleLoading}
+                  className="inline-flex items-center gap-2 px-4 py-2.5 border border-white/20 hover:border-red-400/60 text-xs font-medium uppercase tracking-[0.1em] text-[#A5A5A5] hover:text-red-300 rounded-sm cursor-pointer transition-colors"
+                >
+                  <Unplug className="w-3.5 h-3.5" />
+                  <span>Desconectar</span>
+                </button>
+              </>
             )}
           </div>
         </section>

@@ -24,7 +24,7 @@ Aplicação web institucional, portfólio editorial, história interativa em 12 
   - Alteração obrigatória da senha no primeiro acesso.
   - Senha armazenada exclusivamente em hash `scrypt` com salt aleatório (nunca em texto puro).
   - Sessões assinadas com cookies `HttpOnly`, proteção CSRF (`X-CSRF-Token`) e limitação de tentativas de login.
-  - Conexão Google via botão oficial **Sign in with Google** dentro do painel para autorizar e sincronizar Drive e Sheets com permissão do proprietário.
+  - Conexão Google OAuth 2.0 própria (sem Firebase) via botão **Conectar Google** dentro do painel, validada exclusivamente pelo `ADMIN_EMAIL` com tokens mantidos apenas no servidor.
 
 ---
 
@@ -64,4 +64,4 @@ npm run start    # Execução em produção
 1. Conecte o repositório na Vercel.
 2. Mantenha `Build Command: npm run build` e `Output Directory: dist` (já configurados em `vercel.json`).
 3. Adicione as variáveis de ambiente listadas em `.env.example`.
-4. Após o deploy, acesse `/admin`, efetue login com `ADMIN`/`ADMIN`, defina sua nova senha segura e clique em **Sign in with Google** para criar automaticamente as pastas no Drive e a planilha de gerenciamento.
+4. Após o deploy, acesse `/admin`, efetue login com `ADMIN`/`ADMIN`, defina sua nova senha segura e clique em **Conectar Google** para criar automaticamente a pasta `LUAN HÉRCULES TATTOO` no Drive e a planilha de gerenciamento.

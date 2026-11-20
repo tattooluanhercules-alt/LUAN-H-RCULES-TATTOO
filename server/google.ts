@@ -1,5 +1,6 @@
 import type { Request } from 'express';
 import { adminSecurityState, type AdminSecurityRecord } from './auth.js';
+import { getValidServerGoogleAccessToken } from './googleOAuth.js';
 import { addLog, studioDb } from './store.js';
 import type {
   AppointmentRequest,
@@ -13,7 +14,8 @@ const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const DRIVE_UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3';
 const SHEETS_API = 'https://sheets.googleapis.com/v4/spreadsheets';
 
-const ROOT_FOLDER_NAME = 'LUAN HERCULES TATTOO';
+const ROOT_FOLDER_NAME = 'LUAN HÉRCULES TATTOO';
+const LEGACY_ROOT_FOLDER_NAME = 'LUAN HERCULES TATTOO';
 const SUBFOLDERS = [
   { key: 'historia', name: 'HISTORIA' },
   { key: 'portfolio', name: 'PORTFOLIO' },
@@ -22,7 +24,8 @@ const SUBFOLDERS = [
   { key: 'trilhaSonora', name: 'TRILHA-SONORA' },
 ] as const;
 
-const SPREADSHEET_NAME = 'LUAN HERCULES TATTOO — GERENCIAMENTO';
+const SPREADSHEET_NAME = 'LUAN HÉRCULES TATTOO — GERENCIAMENTO';
+const LEGACY_SPREADSHEET_NAME = 'LUAN HERCULES TATTOO — GERENCIAMENTO';
 
 const SHEET_TABS: Record<string, string[]> = {
   GALERIA: [
@@ -64,59 +67,8 @@ const SHEET_TABS: Record<string, string[]> = {
   LOG: ['ID', 'Ação', 'Detalhes', 'Responsável', 'Data e hora'],
 };
 
-let cachedRefreshAccessToken: { token: string; expiresAt: number } | null = null;
-let cachedLastOwnerToken: string | null = null;
-
-export function setOwnerAccessTokenCache(token: string | null): void {
-  cachedLastOwnerToken = token;
-}
-
 export async function resolveGoogleAccessToken(req?: Request): Promise<string | null> {
-  // 1. Prefer explicit Bearer token passed by authenticated Google Workspace session
-  const authHeader = req?.headers['x-google-access-token'] || req?.headers.authorization;
-  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7).trim();
-    if (token && token !== 'null' && token !== 'undefined') {
-      cachedLastOwnerToken = token;
-      return token;
-    }
-  }
-
-  // 2. Fallback to Vercel / server-side OAuth2 refresh token if configured
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
-
-  if (clientId && clientSecret && refreshToken) {
-    if (cachedRefreshAccessToken && Date.now() < cachedRefreshAccessToken.expiresAt - 60_000) {
-      return cachedRefreshAccessToken.token;
-    }
-    try {
-      const res = await fetch('https://oauth2.googleapis.com/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          client_id: clientId,
-          client_secret: clientSecret,
-          refresh_token: refreshToken,
-          grant_type: 'refresh_token',
-        }),
-      });
-      if (res.ok) {
-        const data = (await res.json()) as { access_token: string; expires_in: number };
-        cachedRefreshAccessToken = {
-          token: data.access_token,
-          expiresAt: Date.now() + (data.expires_in || 3600) * 1000,
-        };
-        return cachedRefreshAccessToken.token;
-      }
-    } catch (err) {
-      console.error('Erro ao renovar refresh token Google:', err);
-    }
-  }
-
-  // 3. Fallback to recent active owner session token in current server process
-  return cachedLastOwnerToken;
+  return getValidServerGoogleAccessToken(req);
 }
 
 async function googleFetch(url: string, token: string, init: RequestInit = {}): Promise<Response> {
@@ -171,7 +123,8 @@ export async function ensureDriveFolders(token: string) {
   let rootId =
     studioDb.workspace.rootFolderId ||
     process.env.GOOGLE_DRIVE_FOLDER_ID ||
-    (await findFolderByName(token, ROOT_FOLDER_NAME));
+    (await findFolderByName(token, ROOT_FOLDER_NAME)) ||
+    (await findFolderByName(token, LEGACY_ROOT_FOLDER_NAME));
 
   if (!rootId) {
     rootId = await createFolder(token, ROOT_FOLDER_NAME);
@@ -199,7 +152,7 @@ export async function ensureManagementSheet(token: string, rootFolderId: string)
   let sheetId = studioDb.workspace.sheetId || process.env.GOOGLE_SHEET_ID || null;
 
   if (!sheetId) {
-    const q = `mimeType = 'application/vnd.google-apps.spreadsheet' and name = '${SPREADSHEET_NAME}' and '${rootFolderId}' in parents and trashed = false`;
+    const q = `mimeType = 'application/vnd.google-apps.spreadsheet' and (name = '${SPREADSHEET_NAME}' or name = '${LEGACY_SPREADSHEET_NAME}') and '${rootFolderId}' in parents and trashed = false`;
     const searchRes = await googleFetch(
       `${DRIVE_API}/files?q=${encodeURIComponent(q)}&fields=files(id,name)`,
       token
@@ -262,7 +215,7 @@ export async function ensureManagementSheet(token: string, rootFolderId: string)
     let needsHeader = true;
     if (checkRes.ok) {
       const checkJson = (await checkRes.json()) as { values?: string[][] };
-      if (checkJson.values && checkJson.values.length > 0 && checkJson.values[0].length > 0) {
+      if (checkJson.values && checkJson.values.length > 0 && (checkJson.values[0]?.length ?? 0) > 0) {
         needsHeader = false;
       }
     }
@@ -743,3 +696,156 @@ export async function hydrateFromSheetIfPopulated(token: string): Promise<void> 
   studioDb.workspace.connected = true;
   studioDb.workspace.lastSyncedAt = new Date().toISOString();
 }
+
+export async function listStudioDriveFiles(token: string, folderId?: string) {
+  const { rootFolderId, folders } = await ensureDriveFolders(token);
+  const targetFolderId = folderId || rootFolderId;
+
+  const q = `'${targetFolderId}' in parents and trashed = false`;
+  const url = `${DRIVE_API}/files?q=${encodeURIComponent(
+    q
+  )}&fields=files(id,name,mimeType,size,modifiedTime,webViewLink,parents)&orderBy=folder,name&pageSize=100`;
+
+  const res = await googleFetch(url, token);
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Falha ao listar arquivos no Google Drive: ${errText}`);
+  }
+
+  const data = (await res.json()) as {
+    files?: Array<{
+      id: string;
+      name: string;
+      mimeType: string;
+      size?: string;
+      modifiedTime?: string;
+      webViewLink?: string;
+    }>;
+  };
+
+  return {
+    rootFolderId,
+    folders,
+    currentFolderId: targetFolderId,
+    files: data.files || [],
+  };
+}
+
+export async function readSpreadsheetById(
+  token: string,
+  spreadsheetId: string,
+  tab?: string,
+  range?: string
+) {
+  const metaRes = await googleFetch(
+    `${SHEETS_API}/${encodeURIComponent(spreadsheetId)}?fields=spreadsheetId,properties.title,sheets.properties`,
+    token
+  );
+  if (!metaRes.ok) {
+    const errText = await metaRes.text();
+    throw new Error(`Falha ao consultar planilha Google Sheets: ${errText}`);
+  }
+
+  const meta = (await metaRes.json()) as {
+    spreadsheetId: string;
+    properties?: { title?: string };
+    sheets?: Array<{ properties?: { sheetId?: number; title?: string } }>;
+  };
+
+  const targetTab =
+    tab || meta.sheets?.[0]?.properties?.title || 'GALERIA';
+  const targetRange = range || `${targetTab}!A1:Z200`;
+
+  const valuesRes = await googleFetch(
+    `${SHEETS_API}/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(targetRange)}`,
+    token
+  );
+  if (!valuesRes.ok) {
+    const errText = await valuesRes.text();
+    throw new Error(`Falha ao ler valores da aba "${targetTab}": ${errText}`);
+  }
+
+  const valuesData = (await valuesRes.json()) as {
+    range?: string;
+    values?: string[][];
+  };
+
+  return {
+    spreadsheetId: meta.spreadsheetId,
+    title: meta.properties?.title || SPREADSHEET_NAME,
+    tabs: (meta.sheets || []).map((s) => s.properties?.title).filter(Boolean) as string[],
+    activeTab: targetTab,
+    range: valuesData.range || targetRange,
+    values: valuesData.values || [],
+  };
+}
+
+export async function upsertRowInSpreadsheet(
+  token: string,
+  spreadsheetId: string,
+  tab: string,
+  rowValues: Array<string | number | boolean>
+): Promise<{ mode: 'updated' | 'inserted'; rowNumber: number }> {
+  const cleanTab = tab || 'GALERIA';
+  const idCell = rowValues[0] !== undefined ? String(rowValues[0]).trim() : '';
+
+  // Read column A to prevent duplicate records with the same ID
+  const colARes = await googleFetch(
+    `${SHEETS_API}/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(
+      `${cleanTab}!A1:A1000`
+    )}`,
+    token
+  );
+
+  if (colARes.ok && idCell) {
+    const colAData = (await colARes.json()) as { values?: string[][] };
+    const rows = colAData.values || [];
+    const existingIdx = rows.findIndex((r, idx) => idx > 0 && String(r[0] || '').trim() === idCell);
+    if (existingIdx !== -1) {
+      const rowNumber = existingIdx + 1;
+      const updateRange = `${cleanTab}!A${rowNumber}`;
+      const updateRes = await googleFetch(
+        `${SHEETS_API}/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(
+          updateRange
+        )}?valueInputOption=USER_ENTERED`,
+        token,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ values: [rowValues] }),
+        }
+      );
+      if (!updateRes.ok) {
+        const errText = await updateRes.text();
+        throw new Error(`Falha ao atualizar registro na planilha: ${errText}`);
+      }
+      return { mode: 'updated', rowNumber };
+    }
+  }
+
+  const appendRes = await googleFetch(
+    `${SHEETS_API}/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(
+      `${cleanTab}!A1`
+    )}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+    token,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: [rowValues] }),
+    }
+  );
+  if (!appendRes.ok) {
+    const errText = await appendRes.text();
+    throw new Error(`Falha ao inserir registro na planilha: ${errText}`);
+  }
+
+  const appendJson = (await appendRes.json()) as {
+    updates?: { updatedRange?: string };
+  };
+  const match = appendJson.updates?.updatedRange?.match(/![A-Z]+(\d+)/);
+  return {
+    mode: 'inserted',
+    rowNumber: match ? Number(match[1]) : 0,
+  };
+}
+

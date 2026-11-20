@@ -20,13 +20,27 @@ import {
   ensureDriveFolders,
   ensureManagementSheet,
   hydrateFromSheetIfPopulated,
+  listStudioDriveFiles,
   makeFileReadableByLink,
+  readSpreadsheetById,
   resolveGoogleAccessToken,
-  setOwnerAccessTokenCache,
   syncAdminHashWithAppData,
   syncAllToSheets,
   uploadBufferToDrive,
+  upsertRowInSpreadsheet,
 } from './google.js';
+import {
+  clearGoogleSession,
+  createOAuthAuthorizationUrl,
+  exchangeAuthorizationCode,
+  fetchGoogleUserEmail,
+  getGoogleConnectionSummary,
+  getOAuthConfigDiagnostics,
+  isAuthorizedAdminEmail,
+  persistGoogleSessionCookie,
+  revokeGoogleToken,
+  validateOAuthState,
+} from './googleOAuth.js';
 import { addLog, sanitizeText, studioDb } from './store.js';
 import type {
   AppointmentRequest,
@@ -464,7 +478,6 @@ export function createStudioApp() {
 
   app.post('/api/admin/logout', (req: Request, res: Response) => {
     clearAdminSessionCookies(req, res);
-    setOwnerAccessTokenCache(null);
     res.json({ ok: true });
   });
 
@@ -537,11 +550,331 @@ export function createStudioApp() {
     });
   });
 
+  // ---------------------------------------------------------------------------
+  // GOOGLE OAUTH 2.0, DRIVE v3 & SHEETS v4 (SERVER-SIDE ONLY)
+  // ---------------------------------------------------------------------------
+  app.get('/api/google/auth', requireAdminAuth, (req: Request, res: Response) => {
+    const diag = getOAuthConfigDiagnostics(req);
+    if (!diag.configured) {
+      res.status(400).json({
+        error: `Configuração OAuth incompleta no servidor. Defina as variáveis: ${diag.missingEnvVars.join(', ')}.`,
+        missingEnvVars: diag.missingEnvVars,
+        redirectUri: diag.redirectUri,
+      });
+      return;
+    }
+
+    try {
+      const adminUsername =
+        (req as Request & { adminSession?: { username: string } }).adminSession?.username || 'ADMIN';
+      const authUrl = createOAuthAuthorizationUrl(req, res, adminUsername);
+
+      if (req.query.format === 'json' || req.headers.accept?.includes('application/json')) {
+        res.json({ ok: true, authUrl });
+        return;
+      }
+      res.redirect(302, authUrl);
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Erro ao iniciar autenticação Google.',
+      });
+    }
+  });
+
+  app.get('/api/google/callback', async (req: Request, res: Response) => {
+    const oauthError = sanitizeText(req.query.error, 120);
+    const code = typeof req.query.code === 'string' ? req.query.code : '';
+    const state = typeof req.query.state === 'string' ? req.query.state : '';
+
+    const renderCallbackHtml = (ok: boolean, title: string, message: string, redirectQuery: string) => {
+      const safeTitle = sanitizeText(title, 120);
+      const safeMsg = sanitizeText(message, 400);
+      return `<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${safeTitle} — Luan Hércules Tattoo Studio</title>
+  <style>
+    body { background:#080808; color:#fff; font-family: system-ui, -apple-system, sans-serif; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:24px; }
+    .card { max-width:460px; width:100%; background:#151515; border:1px solid ${ok ? '#C9A34A' : '#ef4444'}; padding:32px; border-radius:4px; }
+    h1 { font-size:22px; margin:0 0 12px; color:${ok ? '#E2C47A' : '#fca5a5'}; }
+    p { color:#A5A5A5; font-size:14px; line-height:1.6; margin:0 0 24px; }
+    a.btn { display:inline-block; background:#C9A34A; color:#080808; text-decoration:none; padding:12px 20px; font-weight:600; font-size:12px; letter-spacing:.1em; text-transform:uppercase; border-radius:2px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>${safeTitle}</h1>
+    <p>${safeMsg}</p>
+    <a class="btn" href="/admin?${redirectQuery}">Voltar ao Painel Administrativo</a>
+  </div>
+  <script>
+    try {
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage({ type: 'lh-google-oauth-result', ok: ${ok}, message: ${JSON.stringify(safeMsg)} }, window.location.origin);
+        setTimeout(function() { window.close(); }, 1200);
+      } else {
+        setTimeout(function() { window.location.replace('/admin?${redirectQuery}'); }, 900);
+      }
+    } catch (e) {}
+  </script>
+</body>
+</html>`;
+    };
+
+    if (oauthError) {
+      res
+        .status(400)
+        .send(
+          renderCallbackHtml(
+            false,
+            'Autorização cancelada',
+            `O Google retornou: ${oauthError}.`,
+            `google_error=${encodeURIComponent(oauthError)}`
+          )
+        );
+      return;
+    }
+
+    const validState = validateOAuthState(req, res, state);
+    if (!validState || !code) {
+      res
+        .status(403)
+        .send(
+          renderCallbackHtml(
+            false,
+            'Validação de segurança falhou',
+            'Parâmetro state CSRF inválido ou expirado. Tente conectar novamente pelo painel administrativo.',
+            'google_error=invalid_state'
+          )
+        );
+      return;
+    }
+
+    try {
+      const tokens = await exchangeAuthorizationCode(code, validState.redirectUri);
+      const userInfo = await fetchGoogleUserEmail(tokens.accessToken);
+
+      if (!userInfo.verified || !isAuthorizedAdminEmail(userInfo.email)) {
+        await revokeGoogleToken(tokens.refreshToken || tokens.accessToken);
+        addLog(
+          'Acesso Google bloqueado',
+          `Tentativa com e-mail não autorizado: ${userInfo.email}`,
+          'SEGURANÇA'
+        );
+        res
+          .status(403)
+          .send(
+            renderCallbackHtml(
+              false,
+              'Conta não autorizada',
+              `O e-mail ${userInfo.email} não corresponde ao ADMIN_EMAIL autorizado para administrar este estúdio.`,
+              'google_error=unauthorized_email'
+            )
+          );
+        return;
+      }
+
+      persistGoogleSessionCookie(req, res, {
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+        expiresAt: Date.now() + tokens.expiresIn * 1000,
+        email: userInfo.email,
+        connectedAt: new Date().toISOString(),
+      });
+
+      // Provision folders, spreadsheet, and appDataFolder security hash immediately
+      const loadedHash = await syncAdminHashWithAppData(tokens.accessToken, 'load');
+      if (!loadedHash) {
+        await syncAdminHashWithAppData(tokens.accessToken, 'save');
+      }
+      const { rootFolderId } = await ensureDriveFolders(tokens.accessToken);
+      const sheetId = await ensureManagementSheet(tokens.accessToken, rootFolderId);
+      await hydrateFromSheetIfPopulated(tokens.accessToken);
+      await syncAllToSheets(tokens.accessToken);
+
+      addLog(
+        'Google OAuth 2.0 conectado',
+        `Conta ${userInfo.email} autorizada. Pasta ${rootFolderId} e planilha ${sheetId} sincronizadas.`,
+        'ADMIN'
+      );
+
+      res
+        .status(200)
+        .send(
+          renderCallbackHtml(
+            true,
+            'Conta Google conectada',
+            `Conectado com sucesso como ${userInfo.email}. Pastas no Drive e planilha sincronizadas.`,
+            'google=connected'
+          )
+        );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Erro ao concluir conexão Google.';
+      res
+        .status(502)
+        .send(
+          renderCallbackHtml(
+            false,
+            'Erro na integração Google',
+            msg,
+            `google_error=${encodeURIComponent(msg)}`
+          )
+        );
+    }
+  });
+
+  app.get('/api/google/status', requireAdminAuth, async (req: Request, res: Response) => {
+    // Attempt silent auto-refresh if cookie or env refresh token is present
+    const token = await resolveGoogleAccessToken(req);
+    const summary = getGoogleConnectionSummary(req);
+    res.json({
+      ...summary,
+      connected: Boolean(token) || summary.connected,
+      status: Boolean(token) || summary.connected ? 'Conectado' : 'Desconectado',
+    });
+  });
+
+  app.post('/api/google/disconnect', requireAdminAuth, async (req: Request, res: Response) => {
+    await clearGoogleSession(req, res);
+    res.json({ ok: true, connected: false, status: 'Desconectado' });
+  });
+
+  app.get('/api/google/drive', requireAdminAuth, async (req: Request, res: Response) => {
+    const token = await resolveGoogleAccessToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Conta Google desconectada. Clique em Conectar Google.' });
+      return;
+    }
+
+    try {
+      const folderId =
+        typeof req.query.folderId === 'string' && req.query.folderId.trim()
+          ? sanitizeText(req.query.folderId, 120)
+          : undefined;
+      const result = await listStudioDriveFiles(token, folderId);
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Erro ao consultar Google Drive API v3.',
+      });
+    }
+  });
+
+  app.post('/api/google/drive/folders', requireAdminAuth, async (req: Request, res: Response) => {
+    const token = await resolveGoogleAccessToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Conta Google desconectada. Conecte sua conta primeiro.' });
+      return;
+    }
+
+    try {
+      const { rootFolderId, folders } = await ensureDriveFolders(token);
+      studioDb.workspace.connected = true;
+      addLog(
+        'Estrutura Drive verificada',
+        `Pasta principal LUAN HERCULES TATTOO (${rootFolderId}) e subpastas organizadas.`,
+        'ADMIN'
+      );
+      res.json({ ok: true, rootFolderId, folders });
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Erro ao criar pastas no Google Drive.',
+      });
+    }
+  });
+
+  app.post('/api/google/sheets', requireAdminAuth, async (req: Request, res: Response) => {
+    const token = await resolveGoogleAccessToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Conta Google desconectada. Conecte sua conta primeiro.' });
+      return;
+    }
+
+    try {
+      const { rootFolderId, folders } = await ensureDriveFolders(token);
+      const sheetId = await ensureManagementSheet(token, rootFolderId);
+      await syncAllToSheets(token);
+      addLog(
+        'Planilha sincronizada',
+        `Planilha LUAN HERCULES TATTOO — GERENCIAMENTO (${sheetId}) atualizada.`,
+        'ADMIN'
+      );
+      res.json({
+        ok: true,
+        rootFolderId,
+        folders,
+        sheetId,
+        sheetUrl: studioDb.workspace.sheetUrl,
+      });
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Erro ao criar ou sincronizar planilha.',
+      });
+    }
+  });
+
+  app.get('/api/google/sheets/:id', requireAdminAuth, async (req: Request, res: Response) => {
+    const token = await resolveGoogleAccessToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Conta Google desconectada. Conecte sua conta primeiro.' });
+      return;
+    }
+
+    try {
+      const sheetId = sanitizeText(req.params.id, 140);
+      const tab = typeof req.query.tab === 'string' ? sanitizeText(req.query.tab, 60) : undefined;
+      const range =
+        typeof req.query.range === 'string' ? sanitizeText(req.query.range, 80) : undefined;
+      const data = await readSpreadsheetById(token, sheetId, tab, range);
+      res.json({ ok: true, ...data });
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Erro ao ler dados da planilha Google Sheets.',
+      });
+    }
+  });
+
+  app.post('/api/google/sheets/:id/rows', requireAdminAuth, async (req: Request, res: Response) => {
+    const token = await resolveGoogleAccessToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Conta Google desconectada. Conecte sua conta primeiro.' });
+      return;
+    }
+
+    const sheetId = sanitizeText(req.params.id, 140);
+    const tab = sanitizeText(req.body?.tab, 60) || 'GALERIA';
+    const values = Array.isArray(req.body?.values) ? req.body.values : null;
+
+    if (!values || values.length === 0) {
+      res.status(400).json({ error: 'Informe um array "values" válido para gravar na planilha.' });
+      return;
+    }
+
+    try {
+      const cleanValues = values.map((v: unknown) =>
+        typeof v === 'number' || typeof v === 'boolean' ? v : sanitizeText(String(v ?? ''), 1500)
+      );
+      const result = await upsertRowInSpreadsheet(token, sheetId, tab, cleanValues);
+      addLog(
+        `Registro ${result.mode === 'updated' ? 'atualizado' : 'inserido'} no Sheets`,
+        `Aba ${tab} · Linha ${result.rowNumber} · ID ${cleanValues[0] || '-'}`,
+        'ADMIN'
+      );
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Erro ao gravar registro no Google Sheets.',
+      });
+    }
+  });
+
   app.post('/api/admin/workspace/init', requireAdminAuth, async (req: Request, res: Response) => {
     const token = await resolveGoogleAccessToken(req);
     if (!token) {
       res.status(401).json({
-        error: 'Conecte sua conta Google no botão "Sign in with Google" antes de sincronizar.',
+        error: 'Conecte sua conta Google no botão "Conectar Google" antes de sincronizar.',
       });
       return;
     }

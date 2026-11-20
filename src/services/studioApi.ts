@@ -11,7 +11,6 @@ import type {
   TattooCategory,
   WorkspaceSyncState,
 } from '../types/studio';
-import { getWorkspaceAccessToken } from './googleWorkspaceAuth';
 
 let currentCsrfToken = '';
 let currentSessionToken = '';
@@ -34,10 +33,6 @@ function buildHeaders(extra?: Record<string, string>): HeadersInit {
   }
   if (currentSessionToken) {
     headers['X-Admin-Session'] = currentSessionToken;
-  }
-  const googleToken = getWorkspaceAccessToken();
-  if (googleToken) {
-    headers['X-Google-Access-Token'] = `Bearer ${googleToken}`;
   }
   return headers;
 }
@@ -170,6 +165,74 @@ export async function fetchAdminDashboard(): Promise<AdminDashboardPayload> {
     headers: buildHeaders(),
   });
   return parseJsonOrThrow<AdminDashboardPayload>(res);
+}
+
+export interface GoogleConnectionStatus {
+  connected: boolean;
+  status: 'Conectado' | 'Desconectado';
+  email: string | null;
+  configured: boolean;
+  missingEnvVars: string[];
+  adminEmailConfigured: boolean;
+  redirectUri: string;
+  rootFolderId: string | null;
+  folders: Record<string, string | undefined>;
+  sheetId: string | null;
+  sheetUrl: string | null;
+  lastSyncedAt: string | null;
+}
+
+export async function fetchGoogleStatus(): Promise<GoogleConnectionStatus> {
+  const res = await fetch('/api/google/status', {
+    credentials: 'include',
+    headers: buildHeaders(),
+  });
+  return parseJsonOrThrow<GoogleConnectionStatus>(res);
+}
+
+export async function fetchGoogleAuthUrl(): Promise<{ ok: boolean; authUrl: string }> {
+  const res = await fetch('/api/google/auth?format=json', {
+    credentials: 'include',
+    headers: buildHeaders(),
+  });
+  return parseJsonOrThrow<{ ok: boolean; authUrl: string }>(res);
+}
+
+export async function disconnectGoogleAccount() {
+  const res = await fetch('/api/google/disconnect', {
+    method: 'POST',
+    credentials: 'include',
+    headers: buildHeaders(),
+  });
+  return parseJsonOrThrow<{ ok: boolean; connected: boolean; status: 'Desconectado' }>(res);
+}
+
+export async function createGoogleDriveFolders() {
+  const res = await fetch('/api/google/drive/folders', {
+    method: 'POST',
+    credentials: 'include',
+    headers: buildHeaders(),
+  });
+  return parseJsonOrThrow<{
+    ok: boolean;
+    rootFolderId: string;
+    folders: Record<string, string>;
+  }>(res);
+}
+
+export async function syncGoogleSheets() {
+  const res = await fetch('/api/google/sheets', {
+    method: 'POST',
+    credentials: 'include',
+    headers: buildHeaders(),
+  });
+  return parseJsonOrThrow<{
+    ok: boolean;
+    rootFolderId: string;
+    folders: Record<string, string>;
+    sheetId: string;
+    sheetUrl: string;
+  }>(res);
 }
 
 export async function initializeGoogleWorkspace() {
