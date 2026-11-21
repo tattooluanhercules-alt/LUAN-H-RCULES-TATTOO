@@ -41,6 +41,18 @@ import {
   revokeGoogleToken,
   validateOAuthState,
 } from './googleOAuth.js';
+import {
+  appendAppointmentViaAppsScript,
+  callAppsScript,
+  deleteAssetViaAppsScript,
+  ensureAppsScriptWorkspace,
+  getAppsScriptSourceCode,
+  getAppsScriptStatusSummary,
+  hydrateViaAppsScript,
+  isAppsScriptConfigured,
+  syncAllViaAppsScript,
+  uploadAssetViaAppsScript,
+} from './appsScript.js';
 import { addLog, sanitizeText, studioDb } from './store.js';
 import type {
   AppointmentRequest,
@@ -73,6 +85,19 @@ function isValidEmail(email: string): boolean {
 
 function getMaxUploadBytes(): number {
   return (studioDb.config.maxUploadMb || 25) * 1024 * 1024;
+}
+
+async function syncStudioWorkspace(req?: Request): Promise<boolean> {
+  const token = await resolveGoogleAccessToken(req);
+  if (token) {
+    await syncAllToSheets(token);
+    return true;
+  }
+  if (isAppsScriptConfigured()) {
+    await syncAllViaAppsScript();
+    return true;
+  }
+  return false;
 }
 
 export function createStudioApp() {
@@ -202,6 +227,23 @@ export function createStudioApp() {
             } catch (err) {
               console.warn('Não foi possível enviar referência ao Drive:', err);
             }
+          } else if (isAppsScriptConfigured()) {
+            try {
+              const ext = mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : 'jpg';
+              const fileName = `ref-${Date.now()}-${fullName.toLowerCase().replace(/[^a-z0-9]/g, '-')}.${ext}`;
+              const uploaded = await uploadAssetViaAppsScript({
+                folderKey: 'bastidores',
+                fileName,
+                mimeType: mime,
+                base64Data: match[2],
+                makePublic: false,
+              });
+              referenceDriveFileId = uploaded.id;
+              referenceImageUrl = `/api/media/image/${uploaded.id}`;
+            } catch (err) {
+              console.warn('Não foi possível enviar referência via Apps Script:', err);
+              referenceImageUrl = body.referenceBase64;
+            }
           } else {
             referenceImageUrl = body.referenceBase64;
           }
@@ -237,6 +279,13 @@ export function createStudioApp() {
           syncedToSheet = true;
         } catch (err) {
           console.warn('Agendamento salvo em memória; erro ao sincronizar Google Sheets:', err);
+        }
+      } else if (isAppsScriptConfigured()) {
+        try {
+          await appendAppointmentViaAppsScript(appointment);
+          syncedToSheet = true;
+        } catch (err) {
+          console.warn('Agendamento salvo em memória; erro ao enviar via Apps Script:', err);
         }
       }
 
@@ -281,13 +330,10 @@ export function createStudioApp() {
       'LGPD_TITULAR'
     );
 
-    const token = await resolveGoogleAccessToken(req);
-    if (token && studioDb.workspace.sheetId) {
-      try {
-        await syncAllToSheets(token);
-      } catch (err) {
-        console.warn('Aviso ao sincronizar exclusão LGPD no Sheets:', err);
-      }
+    try {
+      await syncStudioWorkspace(req);
+    } catch (err) {
+      console.warn('Aviso ao sincronizar exclusão LGPD no Sheets:', err);
     }
 
     res.json({
@@ -348,6 +394,20 @@ export function createStudioApp() {
         : await fetch(`https://drive.google.com/uc?export=download&id=${encodeURIComponent(fileId)}`);
 
       if (!upstream.ok) {
+        if (!token && isAppsScriptConfigured()) {
+          try {
+            const scriptRes = await callAppsScript<{ mimeType: string; base64Data: string }>(
+              'getFileBase64',
+              { fileId }
+            );
+            res.setHeader('Content-Type', scriptRes.mimeType || 'image/jpeg');
+            res.setHeader('Cache-Control', 'public, max-age=86400');
+            res.end(Buffer.from(scriptRes.base64Data, 'base64'));
+            return;
+          } catch {
+            // Fall through to upstream error status
+          }
+        }
         res.status(upstream.status).json({ error: 'Imagem indisponível.' });
         return;
       }
@@ -729,11 +789,102 @@ export function createStudioApp() {
     // Attempt silent auto-refresh if cookie or env refresh token is present
     const token = await resolveGoogleAccessToken(req);
     const summary = getGoogleConnectionSummary(req);
+    const appsScript = getAppsScriptStatusSummary();
+    const oauthConnected = Boolean(token) || summary.connected;
+    const connected = oauthConnected || appsScript.connected;
+
     res.json({
       ...summary,
-      connected: Boolean(token) || summary.connected,
-      status: Boolean(token) || summary.connected ? 'Conectado' : 'Desconectado',
+      email: summary.email || appsScript.email || null,
+      connected,
+      status: connected ? 'Conectado' : 'Desconectado',
+      connectionMethod: oauthConnected ? 'oauth' : appsScript.connected ? 'apps-script' : 'none',
+      appsScript,
     });
+  });
+
+  app.get('/api/google/apps-script/code', requireAdminAuth, (_req: Request, res: Response) => {
+    try {
+      const code = getAppsScriptSourceCode();
+      const appsScript = getAppsScriptStatusSummary();
+      res.json({
+        ok: true,
+        code,
+        configured: appsScript.configured,
+        hasUrl: appsScript.hasUrl,
+        hasSecret: appsScript.hasSecret,
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Não foi possível ler o código Apps Script.',
+      });
+    }
+  });
+
+  app.post('/api/google/apps-script/test', requireAdminAuth, async (_req: Request, res: Response) => {
+    if (!isAppsScriptConfigured()) {
+      res.status(400).json({
+        error:
+          'Configure APPS_SCRIPT_URL e APPS_SCRIPT_SECRET nas variáveis de ambiente do servidor (Secrets / Vercel) antes de testar.',
+      });
+      return;
+    }
+
+    try {
+      const result = await ensureAppsScriptWorkspace();
+      addLog(
+        'Conexão Apps Script verificada',
+        `Pasta ${result.rootFolderId} e planilha ${result.sheetId} validadas via Planilha Google.`,
+        'ADMIN'
+      );
+      res.json({
+        ok: true,
+        email: result.email || null,
+        rootFolderId: result.rootFolderId,
+        folders: result.folders,
+        sheetId: result.sheetId,
+        sheetUrl: result.sheetUrl,
+      });
+    } catch (err) {
+      res.status(502).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Falha ao conectar ao Google Apps Script da planilha.',
+      });
+    }
+  });
+
+  app.post('/api/google/apps-script/sync', requireAdminAuth, async (_req: Request, res: Response) => {
+    if (!isAppsScriptConfigured()) {
+      res.status(400).json({
+        error:
+          'Configure APPS_SCRIPT_URL e APPS_SCRIPT_SECRET nas variáveis de ambiente do servidor antes de sincronizar.',
+      });
+      return;
+    }
+
+    try {
+      await hydrateViaAppsScript();
+      const result = await syncAllViaAppsScript();
+      addLog(
+        'Sincronização Apps Script concluída',
+        `Planilha ${result.sheetId} e pasta ${result.rootFolderId} atualizadas via Apps Script.`,
+        'ADMIN'
+      );
+      res.json({
+        ok: true,
+        workspace: studioDb.workspace,
+        ...result,
+      });
+    } catch (err) {
+      res.status(502).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Falha ao sincronizar com a planilha via Google Apps Script.',
+      });
+    }
   });
 
   app.post('/api/google/disconnect', requireAdminAuth, async (req: Request, res: Response) => {
@@ -742,17 +893,30 @@ export function createStudioApp() {
   });
 
   app.get('/api/google/drive', requireAdminAuth, async (req: Request, res: Response) => {
+    const folderId =
+      typeof req.query.folderId === 'string' && req.query.folderId.trim()
+        ? sanitizeText(req.query.folderId, 120)
+        : undefined;
+
     const token = await resolveGoogleAccessToken(req);
     if (!token) {
+      if (isAppsScriptConfigured()) {
+        try {
+          const result = await callAppsScript('listFiles', { folderId: folderId || '' });
+          res.json(result);
+          return;
+        } catch (err) {
+          res.status(502).json({
+            error: err instanceof Error ? err.message : 'Erro ao listar arquivos via Apps Script.',
+          });
+          return;
+        }
+      }
       res.status(401).json({ error: 'Conta Google desconectada. Clique em Conectar Google.' });
       return;
     }
 
     try {
-      const folderId =
-        typeof req.query.folderId === 'string' && req.query.folderId.trim()
-          ? sanitizeText(req.query.folderId, 120)
-          : undefined;
       const result = await listStudioDriveFiles(token, folderId);
       res.json({ ok: true, ...result });
     } catch (err) {
@@ -765,6 +929,18 @@ export function createStudioApp() {
   app.post('/api/google/drive/folders', requireAdminAuth, async (req: Request, res: Response) => {
     const token = await resolveGoogleAccessToken(req);
     if (!token) {
+      if (isAppsScriptConfigured()) {
+        try {
+          const result = await ensureAppsScriptWorkspace();
+          res.json({ ok: true, rootFolderId: result.rootFolderId, folders: result.folders });
+          return;
+        } catch (err) {
+          res.status(502).json({
+            error: err instanceof Error ? err.message : 'Erro ao criar pastas via Apps Script.',
+          });
+          return;
+        }
+      }
       res.status(401).json({ error: 'Conta Google desconectada. Conecte sua conta primeiro.' });
       return;
     }
@@ -788,6 +964,18 @@ export function createStudioApp() {
   app.post('/api/google/sheets', requireAdminAuth, async (req: Request, res: Response) => {
     const token = await resolveGoogleAccessToken(req);
     if (!token) {
+      if (isAppsScriptConfigured()) {
+        try {
+          const result = await syncAllViaAppsScript();
+          res.json({ ok: true, ...result });
+          return;
+        } catch (err) {
+          res.status(502).json({
+            error: err instanceof Error ? err.message : 'Erro ao sincronizar via Apps Script.',
+          });
+          return;
+        }
+      }
       res.status(401).json({ error: 'Conta Google desconectada. Conecte sua conta primeiro.' });
       return;
     }
@@ -816,17 +1004,30 @@ export function createStudioApp() {
   });
 
   app.get('/api/google/sheets/:id', requireAdminAuth, async (req: Request, res: Response) => {
+    const sheetId = sanitizeText(req.params.id, 140);
+    const tab = typeof req.query.tab === 'string' ? sanitizeText(req.query.tab, 60) : undefined;
+    const range =
+      typeof req.query.range === 'string' ? sanitizeText(req.query.range, 80) : undefined;
+
     const token = await resolveGoogleAccessToken(req);
     if (!token) {
+      if (isAppsScriptConfigured()) {
+        try {
+          const data = await callAppsScript('readSheet', { tab: tab || 'GALERIA' });
+          res.json(data);
+          return;
+        } catch (err) {
+          res.status(502).json({
+            error: err instanceof Error ? err.message : 'Erro ao ler planilha via Apps Script.',
+          });
+          return;
+        }
+      }
       res.status(401).json({ error: 'Conta Google desconectada. Conecte sua conta primeiro.' });
       return;
     }
 
     try {
-      const sheetId = sanitizeText(req.params.id, 140);
-      const tab = typeof req.query.tab === 'string' ? sanitizeText(req.query.tab, 60) : undefined;
-      const range =
-        typeof req.query.range === 'string' ? sanitizeText(req.query.range, 80) : undefined;
       const data = await readSpreadsheetById(token, sheetId, tab, range);
       res.json({ ok: true, ...data });
     } catch (err) {
@@ -837,12 +1038,6 @@ export function createStudioApp() {
   });
 
   app.post('/api/google/sheets/:id/rows', requireAdminAuth, async (req: Request, res: Response) => {
-    const token = await resolveGoogleAccessToken(req);
-    if (!token) {
-      res.status(401).json({ error: 'Conta Google desconectada. Conecte sua conta primeiro.' });
-      return;
-    }
-
     const sheetId = sanitizeText(req.params.id, 140);
     const tab = sanitizeText(req.body?.tab, 60) || 'GALERIA';
     const values = Array.isArray(req.body?.values) ? req.body.values : null;
@@ -852,10 +1047,32 @@ export function createStudioApp() {
       return;
     }
 
+    const cleanValues = values.map((v: unknown) =>
+      typeof v === 'number' || typeof v === 'boolean' ? v : sanitizeText(String(v ?? ''), 1500)
+    );
+
+    const token = await resolveGoogleAccessToken(req);
+    if (!token) {
+      if (isAppsScriptConfigured()) {
+        try {
+          const result = await callAppsScript<{ mode: string; rowNumber: number }>('upsertRow', {
+            tab,
+            values: cleanValues,
+          });
+          res.json(result);
+          return;
+        } catch (err) {
+          res.status(502).json({
+            error: err instanceof Error ? err.message : 'Erro ao gravar linha via Apps Script.',
+          });
+          return;
+        }
+      }
+      res.status(401).json({ error: 'Conta Google desconectada. Conecte sua conta primeiro.' });
+      return;
+    }
+
     try {
-      const cleanValues = values.map((v: unknown) =>
-        typeof v === 'number' || typeof v === 'boolean' ? v : sanitizeText(String(v ?? ''), 1500)
-      );
       const result = await upsertRowInSpreadsheet(token, sheetId, tab, cleanValues);
       addLog(
         `Registro ${result.mode === 'updated' ? 'atualizado' : 'inserido'} no Sheets`,
@@ -873,8 +1090,37 @@ export function createStudioApp() {
   app.post('/api/admin/workspace/init', requireAdminAuth, async (req: Request, res: Response) => {
     const token = await resolveGoogleAccessToken(req);
     if (!token) {
+      if (isAppsScriptConfigured()) {
+        try {
+          await hydrateViaAppsScript();
+          const result = await syncAllViaAppsScript();
+          addLog(
+            'Planilha e Drive sincronizados via Apps Script',
+            `Pasta ${result.rootFolderId} e planilha ${result.sheetId} atualizadas.`,
+            'ADMIN'
+          );
+          res.json({
+            ok: true,
+            workspace: studioDb.workspace,
+            rootFolderId: result.rootFolderId,
+            folders: result.folders,
+            sheetId: result.sheetId,
+            passwordStoredInAppData: adminSecurityState.storedInAppData,
+            mustChangePassword: adminSecurityState.record.mustChangePassword,
+          });
+          return;
+        } catch (err) {
+          res.status(502).json({
+            error:
+              err instanceof Error
+                ? err.message
+                : 'Falha ao sincronizar via Google Apps Script.',
+          });
+          return;
+        }
+      }
       res.status(401).json({
-        error: 'Conecte sua conta Google no botão "Conectar Google" antes de sincronizar.',
+        error: 'Conecte sua conta Google ou configure APPS_SCRIPT_URL/APPS_SCRIPT_SECRET antes de sincronizar.',
       });
       return;
     }
@@ -979,9 +1225,11 @@ export function createStudioApp() {
   // Direct server-side upload (base64 JSON for images/tracks <= ~10MB)
   app.post('/api/admin/upload', requireAdminAuth, async (req: Request, res: Response) => {
     const token = await resolveGoogleAccessToken(req);
-    if (!token) {
+    const useAppsScript = !token && isAppsScriptConfigured();
+    if (!token && !useAppsScript) {
       res.status(401).json({
-        error: 'Conecte sua conta Google para enviar arquivos diretamente ao seu Google Drive.',
+        error:
+          'Conecte sua conta Google ou configure APPS_SCRIPT_URL/APPS_SCRIPT_SECRET para enviar arquivos ao Drive.',
       });
       return;
     }
@@ -1021,18 +1269,33 @@ export function createStudioApp() {
         return;
       }
 
-      const { folders, rootFolderId } = await ensureDriveFolders(token);
-      const folderId =
-        target === 'historia'
-          ? folders.historia || rootFolderId
-          : target === 'musica'
-            ? folders.trilhaSonora || rootFolderId
-            : folders.portfolio || rootFolderId;
+      let driveFileId = '';
+      if (token) {
+        const { folders, rootFolderId } = await ensureDriveFolders(token);
+        const folderId =
+          target === 'historia'
+            ? folders.historia || rootFolderId
+            : target === 'musica'
+              ? folders.trilhaSonora || rootFolderId
+              : folders.portfolio || rootFolderId;
+        const uploaded = await uploadBufferToDrive(token, folderId, fileName, mimeType, buffer, true);
+        driveFileId = uploaded.id;
+      } else {
+        const folderKey =
+          target === 'historia' ? 'historia' : target === 'musica' ? 'musica' : 'portfolio';
+        const uploaded = await uploadAssetViaAppsScript({
+          folderKey,
+          fileName,
+          mimeType,
+          base64Data: cleanB64,
+          makePublic: true,
+        });
+        driveFileId = uploaded.id;
+      }
 
-      const uploaded = await uploadBufferToDrive(token, folderId, fileName, mimeType, buffer, true);
       const record = await registerUploadedDriveAsset({
         target,
-        driveFileId: uploaded.id,
+        driveFileId,
         fileName,
         mimeType,
         caption,
@@ -1042,8 +1305,8 @@ export function createStudioApp() {
         duration,
       });
 
-      await syncAllToSheets(token);
-      res.status(201).json({ ok: true, item: record, driveFileId: uploaded.id });
+      await syncStudioWorkspace(req);
+      res.status(201).json({ ok: true, item: record, driveFileId });
     } catch (err) {
       console.error('Erro no upload:', err);
       res.status(500).json({
@@ -1107,10 +1370,7 @@ export function createStudioApp() {
 
     addLog('Portfólio atualizado', `${item.caption || item.fileName} (${item.category})`, 'ADMIN');
 
-    const token = await resolveGoogleAccessToken(req);
-    if (token) {
-      await syncAllToSheets(token);
-    }
+    await syncStudioWorkspace(req);
     res.json({ ok: true, item });
   });
 
@@ -1125,11 +1385,11 @@ export function createStudioApp() {
     const token = await resolveGoogleAccessToken(req);
     if (token && removed.driveFileId) {
       await deleteDriveFile(token, removed.driveFileId);
+    } else if (removed.driveFileId && isAppsScriptConfigured()) {
+      await deleteAssetViaAppsScript(removed.driveFileId);
     }
     addLog('Trabalho excluído do portfólio', `${removed.caption || removed.fileName}`, 'ADMIN');
-    if (token) {
-      await syncAllToSheets(token);
-    }
+    await syncStudioWorkspace(req);
     res.json({ ok: true });
   });
 
@@ -1148,10 +1408,7 @@ export function createStudioApp() {
     if (typeof body.published === 'boolean') chapter.published = body.published;
 
     addLog('História atualizada', `${chapter.title}`, 'ADMIN');
-    const token = await resolveGoogleAccessToken(req);
-    if (token) {
-      await syncAllToSheets(token);
-    }
+    await syncStudioWorkspace(req);
     res.json({ ok: true, chapter });
   });
 
@@ -1164,10 +1421,7 @@ export function createStudioApp() {
     studioDb.story.sort((a, b) => a.order - b.order);
 
     addLog('Ordem da história atualizada', 'Sequência das 12 fotografias reordenada.', 'ADMIN');
-    const token = await resolveGoogleAccessToken(req);
-    if (token) {
-      await syncAllToSheets(token);
-    }
+    await syncStudioWorkspace(req);
     res.json({ ok: true, story: studioDb.story });
   });
 
@@ -1193,10 +1447,7 @@ export function createStudioApp() {
     }
 
     addLog('Trilha sonora atualizada', `${track.name} · Principal: ${track.selected ? 'Sim' : 'Não'}`, 'ADMIN');
-    const token = await resolveGoogleAccessToken(req);
-    if (token) {
-      await syncAllToSheets(token);
-    }
+    await syncStudioWorkspace(req);
     res.json({ ok: true, track, music: studioDb.music });
   });
 
@@ -1210,14 +1461,14 @@ export function createStudioApp() {
     const token = await resolveGoogleAccessToken(req);
     if (token && removed.driveFileId && removed.driveFileId !== 'ambient-fallback') {
       await deleteDriveFile(token, removed.driveFileId);
+    } else if (removed.driveFileId && removed.driveFileId !== 'ambient-fallback' && isAppsScriptConfigured()) {
+      await deleteAssetViaAppsScript(removed.driveFileId);
     }
     if (removed.selected && studioDb.music.length > 0) {
       studioDb.music[0].selected = true;
     }
     addLog('Música removida', `${removed.name}`, 'ADMIN');
-    if (token) {
-      await syncAllToSheets(token);
-    }
+    await syncStudioWorkspace(req);
     res.json({ ok: true, music: studioDb.music });
   });
 
@@ -1240,10 +1491,7 @@ export function createStudioApp() {
     }
 
     addLog('Status de agendamento alterado', `${appt.fullName} -> ${appt.status}`, 'ADMIN');
-    const token = await resolveGoogleAccessToken(req);
-    if (token) {
-      await syncAllToSheets(token);
-    }
+    await syncStudioWorkspace(req);
     res.json({ ok: true, appointment: appt });
   });
 
@@ -1257,11 +1505,11 @@ export function createStudioApp() {
     const token = await resolveGoogleAccessToken(req);
     if (token && removed.referenceDriveFileId) {
       await deleteDriveFile(token, removed.referenceDriveFileId);
+    } else if (removed.referenceDriveFileId && isAppsScriptConfigured()) {
+      await deleteAssetViaAppsScript(removed.referenceDriveFileId);
     }
     addLog('Registro de agendamento excluído', `${removed.id} (${removed.fullName})`, 'ADMIN');
-    if (token) {
-      await syncAllToSheets(token);
-    }
+    await syncStudioWorkspace(req);
     res.json({ ok: true });
   });
 
@@ -1298,10 +1546,7 @@ export function createStudioApp() {
     }
 
     addLog('Configurações atualizadas', 'Textos, contatos ou parâmetros do estúdio alterados.', 'ADMIN');
-    const token = await resolveGoogleAccessToken(req);
-    if (token) {
-      await syncAllToSheets(token);
-    }
+    await syncStudioWorkspace(req);
     res.json({ ok: true, config: c });
   });
 

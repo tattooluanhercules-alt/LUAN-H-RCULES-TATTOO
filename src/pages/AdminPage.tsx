@@ -37,10 +37,13 @@ import {
   disconnectGoogleAccount,
   fetchAdminDashboard,
   fetchAdminSession,
+  fetchAppsScriptCode,
   fetchGoogleAuthUrl,
   fetchGoogleStatus,
   initializeGoogleWorkspace,
   reorderStoryChapters,
+  syncViaAppsScript,
+  testAppsScriptConnection,
   updateAppointmentStatus,
   updateGalleryItem,
   updateMusicTrack,
@@ -345,9 +348,13 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
     const files = Array.from(e.target.files || []);
     e.target.value = '';
     if (files.length === 0) return;
-    const googleConnected = Boolean(googleStatus?.connected || dashboard?.workspace.connected);
+    const googleConnected = Boolean(
+      googleStatus?.connected ||
+        googleStatus?.appsScript?.configured ||
+        dashboard?.workspace.connected
+    );
     if (!googleConnected && dashboard?.workspace.mode !== 'server-env') {
-      showToast('err', 'Conecte sua conta Google primeiro para enviar fotos ao Google Drive.');
+      showToast('err', 'Conecte sua conta Google ou configure o Apps Script primeiro para enviar fotos ao Drive.');
       return;
     }
 
@@ -373,9 +380,13 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
 
   // Story photo upload (single chapter replacement or batch 12)
   const handleStoryPhotoUpload = async (storyId: string, file: File) => {
-    const googleConnected = Boolean(googleStatus?.connected || dashboard?.workspace.connected);
+    const googleConnected = Boolean(
+      googleStatus?.connected ||
+        googleStatus?.appsScript?.configured ||
+        dashboard?.workspace.connected
+    );
     if (!googleConnected && dashboard?.workspace.mode !== 'server-env') {
-      showToast('err', 'Conecte sua conta Google primeiro para enviar fotografias da história.');
+      showToast('err', 'Conecte sua conta Google ou configure o Apps Script primeiro para enviar fotografias da história.');
       return;
     }
     setUploading(true);
@@ -400,9 +411,13 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
-    const googleConnected = Boolean(googleStatus?.connected || dashboard?.workspace.connected);
+    const googleConnected = Boolean(
+      googleStatus?.connected ||
+        googleStatus?.appsScript?.configured ||
+        dashboard?.workspace.connected
+    );
     if (!googleConnected && dashboard?.workspace.mode !== 'server-env') {
-      showToast('err', 'Conecte sua conta Google para salvar a música na pasta TRILHA-SONORA.');
+      showToast('err', 'Conecte sua conta Google ou configure o Apps Script para salvar na pasta TRILHA-SONORA.');
       return;
     }
     setUploading(true);
@@ -670,7 +685,10 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
             {googleStatus?.connected ? (
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-white">
                 <span className="inline-flex items-center gap-1.5 text-emerald-400">
-                  <CheckCircle2 className="w-4 h-4" /> Conectado
+                  <CheckCircle2 className="w-4 h-4" />
+                  {googleStatus.connectionMethod === 'apps-script'
+                    ? 'Conectado (Google Apps Script)'
+                    : 'Conectado'}
                 </span>
                 {googleStatus.email && (
                   <>
@@ -709,7 +727,7 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
                       onClick={() => setActiveTab('config')}
                       className="underline hover:text-white cursor-pointer"
                     >
-                      Ver diagnóstico em Configurações
+                      Ver diagnóstico ou usar Apps Script em Configurações
                     </button>
                   </div>
                 )}
@@ -739,15 +757,26 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
                   <FolderSync className="w-4 h-4" />
                   <span>{googleLoading ? 'Sincronizando...' : 'Sincronizar Drive & Sheets'}</span>
                 </button>
-                <button
-                  type="button"
-                  onClick={handleDisconnectGoogle}
-                  disabled={googleLoading}
-                  className="inline-flex items-center gap-2 px-4 py-2.5 border border-white/20 hover:border-red-400/60 text-xs font-medium uppercase tracking-[0.1em] text-[#A5A5A5] hover:text-red-300 rounded-sm cursor-pointer transition-colors"
-                >
-                  <Unplug className="w-3.5 h-3.5" />
-                  <span>Desconectar</span>
-                </button>
+                {googleStatus.connectionMethod === 'oauth' ? (
+                  <button
+                    type="button"
+                    onClick={handleDisconnectGoogle}
+                    disabled={googleLoading}
+                    className="inline-flex items-center gap-2 px-4 py-2.5 border border-white/20 hover:border-red-400/60 text-xs font-medium uppercase tracking-[0.1em] text-[#A5A5A5] hover:text-red-300 rounded-sm cursor-pointer transition-colors"
+                  >
+                    <Unplug className="w-3.5 h-3.5" />
+                    <span>Desconectar</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('config')}
+                    className="inline-flex items-center gap-2 px-4 py-2.5 border border-white/20 hover:border-[#C9A34A] text-xs font-medium uppercase tracking-[0.1em] text-[#A5A5A5] hover:text-white rounded-sm cursor-pointer transition-colors"
+                  >
+                    <Settings className="w-3.5 h-3.5" />
+                    <span>Configurar Apps Script</span>
+                  </button>
+                )}
               </>
             )}
           </div>
@@ -1782,6 +1811,9 @@ function SettingsManagerTab({
   const [newPwd, setNewPwd] = useState('');
   const [copiedUriKey, setCopiedUriKey] = useState<string | null>(null);
   const [checkingEnv, setCheckingEnv] = useState(false);
+  const [appsScriptCode, setAppsScriptCode] = useState<string | null>(null);
+  const [showScriptCode, setShowScriptCode] = useState(false);
+  const [appsScriptBusy, setAppsScriptBusy] = useState(false);
 
   const originCallbackUri =
     typeof window !== 'undefined' ? `${window.location.origin}/api/google/callback` : '';
@@ -1806,6 +1838,63 @@ function SettingsManagerTab({
       onSuccessToast('Diagnóstico do servidor atualizado.');
     } finally {
       setCheckingEnv(false);
+    }
+  };
+
+  const handleCopyAppsScript = async () => {
+    setAppsScriptBusy(true);
+    try {
+      const code = appsScriptCode || (await fetchAppsScriptCode()).code;
+      setAppsScriptCode(code);
+      await navigator.clipboard.writeText(code);
+      setCopiedUriKey('apps-script');
+      setTimeout(() => setCopiedUriKey(null), 2500);
+      onSuccessToast('Código Code.gs copiado! Cole em Extensões -> Apps Script na sua Planilha Google.');
+    } catch (err) {
+      onErrorToast(err instanceof Error ? err.message : 'Erro ao copiar código Apps Script.');
+    } finally {
+      setAppsScriptBusy(false);
+    }
+  };
+
+  const handleToggleAppsScriptCode = async () => {
+    if (!appsScriptCode) {
+      try {
+        const res = await fetchAppsScriptCode();
+        setAppsScriptCode(res.code);
+      } catch (err) {
+        onErrorToast(err instanceof Error ? err.message : 'Erro ao carregar código Apps Script.');
+        return;
+      }
+    }
+    setShowScriptCode((prev) => !prev);
+  };
+
+  const handleTestAppsScript = async () => {
+    setAppsScriptBusy(true);
+    try {
+      const res = await testAppsScriptConnection();
+      await onRefreshGoogleStatus();
+      onSuccessToast(
+        `Apps Script conectado! Pasta ${res.rootFolderId} e planilha ${res.sheetId} validadas.`
+      );
+    } catch (err) {
+      onErrorToast(err instanceof Error ? err.message : 'Falha ao testar Apps Script.');
+    } finally {
+      setAppsScriptBusy(false);
+    }
+  };
+
+  const handleSyncAppsScript = async () => {
+    setAppsScriptBusy(true);
+    try {
+      const res = await syncViaAppsScript();
+      await onRefreshGoogleStatus();
+      onSuccessToast(`Planilha ${res.sheetId} sincronizada via Google Apps Script.`);
+    } catch (err) {
+      onErrorToast(err instanceof Error ? err.message : 'Falha ao sincronizar via Apps Script.');
+    } finally {
+      setAppsScriptBusy(false);
     }
   };
 
@@ -2127,6 +2216,149 @@ function SettingsManagerTab({
             )}
           </div>
         </div>
+      </div>
+
+      {/* Google Apps Script (Planilha Google) Bridge Card */}
+      <div className="p-6 bg-[#151515] border border-white/10 rounded-sm space-y-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p className="text-xs uppercase tracking-[0.16em] text-[#C9A34A] mb-1">
+              Execução Direta na Planilha · Google Apps Script
+            </p>
+            <h2 className="font-display text-2xl text-white">
+              Conexão via Google Apps Script (Code.gs)
+            </h2>
+            <p className="text-xs text-[#A5A5A5] mt-1 max-w-2xl leading-relaxed">
+              Permite executar a criação das pastas <span className="text-white">LUAN HÉRCULES TATTOO</span>,
+              das 6 abas e toda a sincronização diretamente dentro da sua Planilha Google via{' '}
+              <strong>Extensões → Apps Script</strong>, sem depender de tela de consentimento OAuth.
+            </p>
+          </div>
+
+          <span
+            className={`px-3 py-1 text-xs font-medium rounded-sm border ${
+              googleStatus?.appsScript?.connected
+                ? 'bg-emerald-950/60 text-emerald-300 border-emerald-500/30'
+                : googleStatus?.appsScript?.configured
+                  ? 'bg-amber-950/60 text-[#E2C47A] border-[#C9A34A]/40'
+                  : 'bg-white/5 text-[#A5A5A5] border-white/10'
+            }`}
+          >
+            {googleStatus?.appsScript?.connected
+              ? 'Apps Script Conectado'
+              : googleStatus?.appsScript?.configured
+                ? 'Configurado (Pronto para testar)'
+                : 'Aguardando implantação'}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+          {[
+            { key: 'APPS_SCRIPT_URL', label: 'URL /exec da implantação Web App' },
+            { key: 'APPS_SCRIPT_SECRET', label: 'Chave secreta gerada no Apps Script' },
+          ].map((item) => {
+            const ok = Boolean(googleStatus?.envStatus?.[item.key]);
+            return (
+              <div
+                key={item.key}
+                className="p-3 bg-[#080808] border border-white/10 rounded-sm flex items-center justify-between gap-2"
+              >
+                <div className="min-w-0">
+                  <p className="font-mono-tabular text-white truncate">{item.key}</p>
+                  <p className="text-[11px] text-[#A5A5A5]">{item.label}</p>
+                </div>
+                <span
+                  className={`px-2 py-0.5 text-[11px] font-medium rounded-sm shrink-0 ${
+                    ok
+                      ? 'bg-emerald-950/60 text-emerald-300 border border-emerald-500/30'
+                      : 'bg-amber-950/60 text-[#E2C47A] border border-[#C9A34A]/40'
+                  }`}
+                >
+                  {ok ? 'Configurada' : 'Pendente'}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+
+        <ol className="text-xs text-[#A5A5A5] space-y-1.5 list-decimal list-inside bg-[#080808] p-4 border border-white/10 rounded-sm">
+          <li>
+            Abra a sua Planilha no Google Sheets e clique em{' '}
+            <strong className="text-white">Extensões → Apps Script</strong>.
+          </li>
+          <li>
+            Clique em <strong className="text-white">Copiar Code.gs</strong> abaixo, cole no editor
+            do Apps Script e salve.
+          </li>
+          <li>
+            Execute a função <span className="font-mono-tabular text-[#E2C47A]">setupStudioWorkspace</span>{' '}
+            (ou use o menu <strong className="text-white">LUAN HÉRCULES STUDIO</strong> na planilha)
+            para criar as pastas, abas e exibir a chave <span className="font-mono-tabular text-white">APPS_SCRIPT_SECRET</span>.
+          </li>
+          <li>
+            Clique em <strong className="text-white">Implantar → Nova implantação → App da Web</strong>{' '}
+            (<em>Executar como: Eu</em> / <em>Quem tem acesso: Qualquer pessoa</em>) e salve a URL{' '}
+            <span className="font-mono-tabular text-white">/exec</span> em{' '}
+            <span className="font-mono-tabular text-white">APPS_SCRIPT_URL</span> e a chave em{' '}
+            <span className="font-mono-tabular text-white">APPS_SCRIPT_SECRET</span> nos Secrets do
+            AI Studio / Vercel.
+          </li>
+        </ol>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={handleCopyAppsScript}
+            disabled={appsScriptBusy}
+            className="inline-flex items-center gap-2 px-4 py-2.5 bg-[#C9A34A] text-[#080808] hover:bg-[#E2C47A] text-xs font-semibold uppercase tracking-[0.1em] rounded-sm cursor-pointer disabled:opacity-50"
+          >
+            {copiedUriKey === 'apps-script' ? (
+              <>
+                <Check className="w-4 h-4" />
+                <span>Code.gs Copiado</span>
+              </>
+            ) : (
+              <>
+                <Copy className="w-4 h-4" />
+                <span>Copiar Code.gs</span>
+              </>
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={handleToggleAppsScriptCode}
+            className="inline-flex items-center gap-2 px-4 py-2.5 border border-white/15 hover:border-[#C9A34A] text-xs uppercase tracking-[0.1em] text-white rounded-sm cursor-pointer"
+          >
+            <span>{showScriptCode ? 'Ocultar Código' : 'Visualizar Code.gs'}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleTestAppsScript}
+            disabled={appsScriptBusy || !googleStatus?.appsScript?.configured}
+            className="inline-flex items-center gap-2 px-4 py-2.5 border border-[#C9A34A]/50 hover:border-[#C9A34A] text-xs uppercase tracking-[0.1em] text-[#E2C47A] rounded-sm cursor-pointer disabled:opacity-40"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${appsScriptBusy ? 'animate-spin' : ''}`} />
+            <span>Testar Conexão Apps Script</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleSyncAppsScript}
+            disabled={appsScriptBusy || !googleStatus?.appsScript?.configured}
+            className="inline-flex items-center gap-2 px-4 py-2.5 border border-emerald-500/40 hover:border-emerald-400 text-xs uppercase tracking-[0.1em] text-emerald-300 rounded-sm cursor-pointer disabled:opacity-40"
+          >
+            <FolderSync className="w-3.5 h-3.5" />
+            <span>Sincronizar via Apps Script</span>
+          </button>
+        </div>
+
+        {showScriptCode && appsScriptCode && (
+          <pre className="p-4 bg-[#080808] border border-white/10 rounded-sm text-[11px] font-mono-tabular text-[#E2C47A] overflow-x-auto max-h-80">
+            <code>{appsScriptCode}</code>
+          </pre>
+        )}
       </div>
 
       {/* Password Change */}

@@ -118,6 +118,8 @@ export function getOAuthConfigDiagnostics(req?: Request) {
   const hasRefreshTokenEnv = Boolean(process.env.GOOGLE_REFRESH_TOKEN?.trim());
   const hasDriveFolderEnv = Boolean(process.env.GOOGLE_DRIVE_FOLDER_ID?.trim());
   const hasSheetIdEnv = Boolean(process.env.GOOGLE_SHEET_ID?.trim());
+  const hasAppsScriptUrl = Boolean(process.env.APPS_SCRIPT_URL?.trim());
+  const hasAppsScriptSecret = Boolean(process.env.APPS_SCRIPT_SECRET?.trim());
 
   const missingEnvVars: string[] = [];
   if (!hasClientId) missingEnvVars.push('GOOGLE_CLIENT_ID');
@@ -140,6 +142,8 @@ export function getOAuthConfigDiagnostics(req?: Request) {
       GOOGLE_REFRESH_TOKEN: hasRefreshTokenEnv,
       GOOGLE_DRIVE_FOLDER_ID: hasDriveFolderEnv,
       GOOGLE_SHEET_ID: hasSheetIdEnv,
+      APPS_SCRIPT_URL: hasAppsScriptUrl,
+      APPS_SCRIPT_SECRET: hasAppsScriptSecret,
     },
   };
 }

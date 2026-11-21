@@ -170,12 +170,23 @@ export async function fetchAdminDashboard(): Promise<AdminDashboardPayload> {
 export interface GoogleConnectionStatus {
   connected: boolean;
   status: 'Conectado' | 'Desconectado';
+  connectionMethod?: 'oauth' | 'apps-script' | 'none';
   email: string | null;
   configured: boolean;
   missingEnvVars: string[];
   adminEmailConfigured: boolean;
   redirectUri: string;
   envStatus?: Record<string, boolean>;
+  appsScript?: {
+    configured: boolean;
+    connected: boolean;
+    hasUrl: boolean;
+    hasSecret: boolean;
+    email: string | null;
+    rootFolderId: string | null;
+    sheetId: string | null;
+    sheetUrl: string | null;
+  };
   rootFolderId: string | null;
   folders: Record<string, string | undefined>;
   sheetId: string | null;
@@ -189,6 +200,50 @@ export async function fetchGoogleStatus(): Promise<GoogleConnectionStatus> {
     headers: buildHeaders(),
   });
   return parseJsonOrThrow<GoogleConnectionStatus>(res);
+}
+
+export async function fetchAppsScriptCode(): Promise<{
+  ok: boolean;
+  code: string;
+  configured: boolean;
+  hasUrl: boolean;
+  hasSecret: boolean;
+}> {
+  const res = await fetch('/api/google/apps-script/code', {
+    credentials: 'include',
+    headers: buildHeaders(),
+  });
+  return parseJsonOrThrow(res);
+}
+
+export async function testAppsScriptConnection(): Promise<{
+  ok: boolean;
+  email: string | null;
+  rootFolderId: string;
+  folders: Record<string, string>;
+  sheetId: string;
+  sheetUrl: string;
+}> {
+  const res = await fetch('/api/google/apps-script/test', {
+    method: 'POST',
+    credentials: 'include',
+    headers: buildHeaders(),
+  });
+  return parseJsonOrThrow(res);
+}
+
+export async function syncViaAppsScript(): Promise<{
+  ok: boolean;
+  rootFolderId: string;
+  sheetId: string;
+  sheetUrl: string;
+}> {
+  const res = await fetch('/api/google/apps-script/sync', {
+    method: 'POST',
+    credentials: 'include',
+    headers: buildHeaders(),
+  });
+  return parseJsonOrThrow(res);
 }
 
 export async function fetchGoogleAuthUrl(): Promise<{ ok: boolean; authUrl: string }> {
