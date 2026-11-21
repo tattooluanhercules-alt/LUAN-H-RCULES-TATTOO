@@ -4,7 +4,9 @@ import {
   ArrowLeft,
   ArrowUp,
   CalendarClock,
+  Check,
   CheckCircle2,
+  Copy,
   ExternalLink,
   Eye,
   EyeOff,
@@ -17,6 +19,7 @@ import {
   Music,
   RefreshCw,
   Settings,
+  ShieldCheck,
   Sparkles,
   Trash2,
   Unplug,
@@ -696,10 +699,19 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
                   no Drive e a planilha LUAN HÉRCULES TATTOO — GERENCIAMENTO.
                 </p>
                 {googleStatus && !googleStatus.configured && (
-                  <p className="text-xs text-[#E2C47A]">
-                    Variáveis pendentes no servidor: {googleStatus.missingEnvVars.join(', ')} ·
-                    Redirect URI: {googleStatus.redirectUri}
-                  </p>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#E2C47A]">
+                    <span>
+                      Variáveis pendentes no servidor: {googleStatus.missingEnvVars.join(', ')} ·
+                      Redirect URI: {googleStatus.redirectUri}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('config')}
+                      className="underline hover:text-white cursor-pointer"
+                    >
+                      Ver diagnóstico em Configurações
+                    </button>
+                  </div>
                 )}
               </div>
             )}
@@ -944,6 +956,8 @@ export function AdminPage({ onNavigate, onStudioMutated }: AdminPageProps) {
               <SettingsManagerTab
                 config={dashboard.config}
                 logs={dashboard.logs}
+                googleStatus={googleStatus}
+                onRefreshGoogleStatus={refreshGoogleStatus}
                 passwordStoredInAppData={session.passwordStoredInAppData}
                 onConfirm={runConfirmed}
                 onSuccessToast={(msg) => showToast('ok', msg)}
@@ -1746,6 +1760,8 @@ function AppointmentsManagerTab({
 function SettingsManagerTab({
   config,
   logs,
+  googleStatus,
+  onRefreshGoogleStatus,
   passwordStoredInAppData,
   onConfirm,
   onSuccessToast,
@@ -1753,6 +1769,8 @@ function SettingsManagerTab({
 }: {
   config: AdminDashboardPayload['config'];
   logs: AdminDashboardPayload['logs'];
+  googleStatus: GoogleConnectionStatus | null;
+  onRefreshGoogleStatus: () => Promise<void>;
   passwordStoredInAppData: boolean;
   onConfirm: ConfirmFn;
   onSuccessToast: (m: string) => void;
@@ -1762,6 +1780,34 @@ function SettingsManagerTab({
   const [aboutText, setAboutText] = useState(config.aboutParagraphs.join('\n\n'));
   const [curPwd, setCurPwd] = useState('');
   const [newPwd, setNewPwd] = useState('');
+  const [copiedUriKey, setCopiedUriKey] = useState<string | null>(null);
+  const [checkingEnv, setCheckingEnv] = useState(false);
+
+  const originCallbackUri =
+    typeof window !== 'undefined' ? `${window.location.origin}/api/google/callback` : '';
+  const serverRedirectUri = googleStatus?.redirectUri || originCallbackUri;
+  const redirectMismatch =
+    Boolean(originCallbackUri && serverRedirectUri) && originCallbackUri !== serverRedirectUri;
+
+  const copyUri = async (key: string, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedUriKey(key);
+      setTimeout(() => setCopiedUriKey(null), 2000);
+    } catch {
+      onErrorToast('Não foi possível copiar automaticamente. Selecione e copie o endereço.');
+    }
+  };
+
+  const handleRecheckEnv = async () => {
+    setCheckingEnv(true);
+    try {
+      await onRefreshGoogleStatus();
+      onSuccessToast('Diagnóstico do servidor atualizado.');
+    } finally {
+      setCheckingEnv(false);
+    }
+  };
 
   const handleSaveConfig = (e: FormEvent) => {
     e.preventDefault();
@@ -1941,6 +1987,147 @@ function SettingsManagerTab({
           Salvar Configurações
         </button>
       </form>
+
+      {/* Google OAuth Server Environment Diagnostics (read-only status, secrets remain in server env) */}
+      <div className="p-6 bg-[#151515] border border-white/10 rounded-sm space-y-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <ShieldCheck className="w-4 h-4 text-[#C9A34A]" />
+              <p className="text-xs uppercase tracking-[0.16em] text-[#C9A34A]">
+                Ambiente Seguro do Servidor · Google OAuth 2.0
+              </p>
+            </div>
+            <h2 className="font-display text-2xl text-white">
+              Variáveis de Ambiente e Redirect URI
+            </h2>
+            <p className="text-xs text-[#A5A5A5] mt-1 max-w-2xl leading-relaxed">
+              Por segurança e compatibilidade com funções serverless na Vercel, segredos como{' '}
+              <span className="font-mono-tabular text-white">GOOGLE_CLIENT_SECRET</span> e{' '}
+              <span className="font-mono-tabular text-white">SESSION_SECRET</span> são mantidos
+              exclusivamente nas variáveis de ambiente do servidor (<strong>Settings → Secrets</strong>{' '}
+              no AI Studio e <strong>Settings → Environment Variables</strong> na Vercel), nunca em
+              formulários ou armazenamento do navegador.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleRecheckEnv}
+            disabled={checkingEnv}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 border border-white/15 hover:border-[#C9A34A] text-xs uppercase tracking-[0.1em] text-[#E2C47A] rounded-sm cursor-pointer disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${checkingEnv ? 'animate-spin' : ''}`} />
+            <span>Verificar Servidor</span>
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+          {[
+            { key: 'GOOGLE_CLIENT_ID', required: true },
+            { key: 'GOOGLE_CLIENT_SECRET', required: true },
+            { key: 'ADMIN_EMAIL', required: true },
+            { key: 'SESSION_SECRET', required: false },
+            { key: 'GOOGLE_REDIRECT_URI', required: false },
+            { key: 'GOOGLE_REFRESH_TOKEN', required: false },
+            { key: 'GOOGLE_DRIVE_FOLDER_ID', required: false },
+            { key: 'GOOGLE_SHEET_ID', required: false },
+          ].map((item) => {
+            const ok = Boolean(googleStatus?.envStatus?.[item.key]);
+            return (
+              <div
+                key={item.key}
+                className="p-3 bg-[#080808] border border-white/10 rounded-sm flex items-center justify-between gap-2"
+              >
+                <div className="min-w-0">
+                  <p className="font-mono-tabular text-white truncate">{item.key}</p>
+                  <p className="text-[11px] text-[#A5A5A5]">
+                    {item.required ? 'Obrigatória' : 'Opcional / Auto'}
+                  </p>
+                </div>
+                <span
+                  className={`px-2 py-0.5 text-[11px] font-medium rounded-sm shrink-0 ${
+                    ok
+                      ? 'bg-emerald-950/60 text-emerald-300 border border-emerald-500/30'
+                      : item.required
+                        ? 'bg-amber-950/60 text-[#E2C47A] border border-[#C9A34A]/40'
+                        : 'bg-white/5 text-[#A5A5A5] border border-white/10'
+                  }`}
+                >
+                  {ok ? 'Configurada' : 'Pendente'}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="space-y-3 pt-1">
+          <div className="p-4 bg-[#080808] border border-white/10 rounded-sm space-y-3">
+            <div>
+              <p className="text-xs uppercase tracking-[0.12em] text-[#A5A5A5] mb-1.5">
+                Redirect URI ativa no servidor
+              </p>
+              <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                <code className="flex-1 px-3 py-2 bg-[#151515] border border-white/10 text-xs text-[#E2C47A] font-mono-tabular break-all rounded-sm">
+                  {serverRedirectUri}
+                </code>
+                <button
+                  type="button"
+                  onClick={() => copyUri('server', serverRedirectUri)}
+                  className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 border border-white/15 hover:border-[#C9A34A] text-xs text-white rounded-sm cursor-pointer shrink-0"
+                >
+                  {copiedUriKey === 'server' ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Copiada</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5 text-[#C9A34A]" />
+                      <span>Copiar URI</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {redirectMismatch && (
+              <div className="pt-2 border-t border-white/10 space-y-2">
+                <p className="text-xs text-[#E2C47A]">
+                  Atenção: este painel está aberto em{' '}
+                  <span className="font-mono-tabular text-white">{originCallbackUri}</span>, mas{' '}
+                  <span className="font-mono-tabular text-white">GOOGLE_REDIRECT_URI</span> no
+                  servidor aponta para outro domínio. Para testar o login Google neste endereço,
+                  adicione esta URI no Google Cloud Console e em{' '}
+                  <span className="font-mono-tabular">GOOGLE_REDIRECT_URI</span>:
+                </p>
+                <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                  <code className="flex-1 px-3 py-2 bg-[#151515] border border-[#C9A34A]/30 text-xs text-white font-mono-tabular break-all rounded-sm">
+                    {originCallbackUri}
+                  </code>
+                  <button
+                    type="button"
+                    onClick={() => copyUri('origin', originCallbackUri)}
+                    className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 border border-[#C9A34A]/40 hover:border-[#C9A34A] text-xs text-[#E2C47A] rounded-sm cursor-pointer shrink-0"
+                  >
+                    {copiedUriKey === 'origin' ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Copiada</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>Copiar URI Atual</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
 
       {/* Password Change */}
       <form

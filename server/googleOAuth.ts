@@ -86,11 +86,13 @@ export function setServerGoogleTokenState(tokens: ServerGoogleTokens | null): vo
 }
 
 export function resolveRedirectUri(req?: Request): string {
-  if (process.env.GOOGLE_REDIRECT_URI) {
-    return process.env.GOOGLE_REDIRECT_URI.trim();
+  const explicit = process.env.GOOGLE_REDIRECT_URI?.trim();
+  if (explicit) {
+    return explicit;
   }
-  if (process.env.APP_URL) {
-    return `${process.env.APP_URL.replace(/\/+$/, '')}/api/google/callback`;
+  const appUrl = process.env.APP_URL?.trim();
+  if (appUrl) {
+    return `${appUrl.replace(/\/+$/, '')}/api/google/callback`;
   }
   if (req) {
     const proto = (req.headers['x-forwarded-proto'] as string)?.split(',')[0]?.trim() || req.protocol || 'http';
@@ -108,18 +110,37 @@ function getGoogleClientId(): string {
 
 export function getOAuthConfigDiagnostics(req?: Request) {
   const clientId = getGoogleClientId();
+  const hasClientId = Boolean(clientId);
+  const hasClientSecret = Boolean(process.env.GOOGLE_CLIENT_SECRET?.trim());
+  const hasAdminEmail = Boolean(process.env.ADMIN_EMAIL?.trim());
+  const hasSessionSecret = Boolean(process.env.SESSION_SECRET?.trim());
+  const hasRedirectUriEnv = Boolean(process.env.GOOGLE_REDIRECT_URI?.trim());
+  const hasRefreshTokenEnv = Boolean(process.env.GOOGLE_REFRESH_TOKEN?.trim());
+  const hasDriveFolderEnv = Boolean(process.env.GOOGLE_DRIVE_FOLDER_ID?.trim());
+  const hasSheetIdEnv = Boolean(process.env.GOOGLE_SHEET_ID?.trim());
+
   const missingEnvVars: string[] = [];
-  if (!clientId) missingEnvVars.push('GOOGLE_CLIENT_ID');
-  if (!process.env.GOOGLE_CLIENT_SECRET) missingEnvVars.push('GOOGLE_CLIENT_SECRET');
-  if (!process.env.ADMIN_EMAIL) missingEnvVars.push('ADMIN_EMAIL');
+  if (!hasClientId) missingEnvVars.push('GOOGLE_CLIENT_ID');
+  if (!hasClientSecret) missingEnvVars.push('GOOGLE_CLIENT_SECRET');
+  if (!hasAdminEmail) missingEnvVars.push('ADMIN_EMAIL');
 
   return {
     configured: missingEnvVars.length === 0,
     missingEnvVars,
-    adminEmailConfigured: Boolean(process.env.ADMIN_EMAIL),
-    hasRefreshTokenEnv: Boolean(process.env.GOOGLE_REFRESH_TOKEN),
-    hasSessionSecretEnv: Boolean(process.env.SESSION_SECRET),
+    adminEmailConfigured: hasAdminEmail,
+    hasRefreshTokenEnv,
+    hasSessionSecretEnv: hasSessionSecret,
     redirectUri: resolveRedirectUri(req),
+    envStatus: {
+      GOOGLE_CLIENT_ID: hasClientId,
+      GOOGLE_CLIENT_SECRET: hasClientSecret,
+      ADMIN_EMAIL: hasAdminEmail,
+      SESSION_SECRET: hasSessionSecret,
+      GOOGLE_REDIRECT_URI: hasRedirectUriEnv,
+      GOOGLE_REFRESH_TOKEN: hasRefreshTokenEnv,
+      GOOGLE_DRIVE_FOLDER_ID: hasDriveFolderEnv,
+      GOOGLE_SHEET_ID: hasSheetIdEnv,
+    },
   };
 }
 
@@ -513,6 +534,7 @@ export function getGoogleConnectionSummary(req?: Request) {
     missingEnvVars: diag.missingEnvVars,
     adminEmailConfigured: diag.adminEmailConfigured,
     redirectUri: diag.redirectUri,
+    envStatus: diag.envStatus,
     rootFolderId: studioDb.workspace.rootFolderId,
     folders: studioDb.workspace.folders,
     sheetId: studioDb.workspace.sheetId,

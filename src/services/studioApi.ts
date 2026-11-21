@@ -175,6 +175,7 @@ export interface GoogleConnectionStatus {
   missingEnvVars: string[];
   adminEmailConfigured: boolean;
   redirectUri: string;
+  envStatus?: Record<string, boolean>;
   rootFolderId: string | null;
   folders: Record<string, string | undefined>;
   sheetId: string | null;
